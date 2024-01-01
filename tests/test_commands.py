@@ -516,7 +516,6 @@ class TestRedisCommands:
     @skip_if_server_version_lt("6.0.0")
     @skip_if_redis_enterprise()
     def test_client_tracking(self, r, r2):
-
         # simple case
         assert r.client_tracking_on()
         assert r.client_tracking_off()
@@ -4909,7 +4908,6 @@ class TestRedisCommands:
     def test_latency_reset(self, r: redis.Redis):
         assert r.latency_reset() == 0
 
-    @pytest.mark.onlynoncluster
     @skip_if_server_version_lt("4.0.0")
     @skip_if_redis_enterprise()
     def test_module_list(self, r):
@@ -5012,7 +5010,6 @@ class TestRedisCommands:
 
     @skip_if_server_version_lt("2.6.0")
     def test_restore(self, r):
-
         # standard restore
         key = "foo"
         r.set(key, "bar")

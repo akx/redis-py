@@ -11,7 +11,7 @@ from redis._parsers import (
     _AsyncRESP3Parser,
     _AsyncRESPBase,
 )
-from redis.asyncio import Redis
+from redis.asyncio import ConnectionPool, Redis
 from redis.asyncio.connection import Connection, UnixDomainSocketConnection, parse_url
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
@@ -85,6 +85,8 @@ async def test_single_connection():
 
     assert init_call_count == 1
     assert command_call_count == 2
+    r.connection = None  # it was a Mock
+    await r.aclose()
 
 
 @skip_if_server_version_lt("4.0.0")
@@ -143,6 +145,7 @@ async def test_connect_retry_on_timeout_error(connect_args):
     conn._connect.side_effect = mock_connect
     await conn.connect()
     assert conn._connect.call_count == 3
+    await conn.disconnect()
 
 
 async def test_connect_without_retry_on_os_error():
@@ -194,6 +197,7 @@ async def test_connection_parse_response_resume(r: redis.Redis):
         pytest.fail("didn't receive a response")
     assert response
     assert i > 0
+    await conn.disconnect()
 
 
 @pytest.mark.onlynoncluster
@@ -254,9 +258,8 @@ async def test_connection_disconect_race(parser_class, connect_args):
     async def do_read():
         return await conn.read_response()
 
-    reader = mock.AsyncMock()
-    writer = mock.AsyncMock()
-    writer.transport = mock.Mock()
+    reader = mock.Mock(spec=asyncio.StreamReader)
+    writer = mock.Mock(spec=asyncio.StreamWriter)
     writer.transport.get_extra_info.side_effect = None
 
     # for HiredisParser
@@ -289,7 +292,7 @@ def test_create_single_connection_client_from_url():
     assert client.single_connection_client is True
 
 
-@pytest.mark.parametrize("from_url", (True, False))
+@pytest.mark.parametrize("from_url", (True, False), ids=("from_url", "from_args"))
 async def test_pool_auto_close(request, from_url):
     """Verify that basic Redis instances have auto_close_connection_pool set to True"""
 
@@ -303,23 +306,187 @@ async def test_pool_auto_close(request, from_url):
 
     r1 = await get_redis_connection()
     assert r1.auto_close_connection_pool is True
-    await r1.close()
+    await r1.aclose()
 
 
-@pytest.mark.parametrize("from_url", (True, False))
-async def test_pool_auto_close_disable(request, from_url):
-    """Verify that auto_close_connection_pool can be disabled"""
+async def test_close_is_aclose(request):
+    """Verify close() calls aclose()"""
+    calls = 0
+
+    async def mock_aclose(self):
+        nonlocal calls
+        calls += 1
+
+    url: str = request.config.getoption("--redis-url")
+    r1 = await Redis.from_url(url)
+    with patch.object(r1, "aclose", mock_aclose):
+        with pytest.deprecated_call():
+            await r1.close()
+        assert calls == 1
+
+    with pytest.deprecated_call():
+        await r1.close()
+
+
+async def test_pool_from_url_deprecation(request):
+    url: str = request.config.getoption("--redis-url")
+
+    with pytest.deprecated_call():
+        return Redis.from_url(url, auto_close_connection_pool=False)
+
+
+async def test_pool_auto_close_disable(request):
+    """Verify that auto_close_connection_pool can be disabled (deprecated)"""
 
     url: str = request.config.getoption("--redis-url")
     url_args = parse_url(url)
 
     async def get_redis_connection():
-        if from_url:
-            return Redis.from_url(url, auto_close_connection_pool=False)
         url_args["auto_close_connection_pool"] = False
-        return Redis(**url_args)
+        with pytest.deprecated_call():
+            return Redis(**url_args)
 
     r1 = await get_redis_connection()
     assert r1.auto_close_connection_pool is False
     await r1.connection_pool.disconnect()
-    await r1.close()
+    await r1.aclose()
+
+
+@pytest.mark.parametrize("from_url", (True, False), ids=("from_url", "from_args"))
+async def test_redis_connection_pool(request, from_url):
+    """Verify that basic Redis instances using `connection_pool`
+    have auto_close_connection_pool set to False"""
+
+    url: str = request.config.getoption("--redis-url")
+    url_args = parse_url(url)
+
+    pool = None
+
+    async def get_redis_connection():
+        nonlocal pool
+        if from_url:
+            pool = ConnectionPool.from_url(url)
+        else:
+            pool = ConnectionPool(**url_args)
+        return Redis(connection_pool=pool)
+
+    called = 0
+
+    async def mock_disconnect(_):
+        nonlocal called
+        called += 1
+
+    with patch.object(ConnectionPool, "disconnect", mock_disconnect):
+        async with await get_redis_connection() as r1:
+            assert r1.auto_close_connection_pool is False
+
+    assert called == 0
+    await pool.disconnect()
+
+
+@pytest.mark.parametrize("from_url", (True, False), ids=("from_url", "from_args"))
+async def test_redis_from_pool(request, from_url):
+    """Verify that basic Redis instances created using `from_pool()`
+    have auto_close_connection_pool set to True"""
+
+    url: str = request.config.getoption("--redis-url")
+    url_args = parse_url(url)
+
+    pool = None
+
+    async def get_redis_connection():
+        nonlocal pool
+        if from_url:
+            pool = ConnectionPool.from_url(url)
+        else:
+            pool = ConnectionPool(**url_args)
+        return Redis.from_pool(pool)
+
+    called = 0
+
+    async def mock_disconnect(_):
+        nonlocal called
+        called += 1
+
+    with patch.object(ConnectionPool, "disconnect", mock_disconnect):
+        async with await get_redis_connection() as r1:
+            assert r1.auto_close_connection_pool is True
+
+    assert called == 1
+    await pool.disconnect()
+
+
+@pytest.mark.parametrize("auto_close", (True, False))
+async def test_redis_pool_auto_close_arg(request, auto_close):
+    """test that redis instance where pool is provided have
+    auto_close_connection_pool set to False, regardless of arg"""
+
+    url: str = request.config.getoption("--redis-url")
+    pool = ConnectionPool.from_url(url)
+
+    async def get_redis_connection():
+        with pytest.deprecated_call():
+            client = Redis(connection_pool=pool, auto_close_connection_pool=auto_close)
+        return client
+
+    called = 0
+
+    async def mock_disconnect(_):
+        nonlocal called
+        called += 1
+
+    with patch.object(ConnectionPool, "disconnect", mock_disconnect):
+        async with await get_redis_connection() as r1:
+            assert r1.auto_close_connection_pool is False
+
+    assert called == 0
+    await pool.disconnect()
+
+
+async def test_client_garbage_collection(request):
+    """
+    Test that a Redis client will call _close() on any
+    connection that it holds at time of destruction
+    """
+
+    url: str = request.config.getoption("--redis-url")
+    pool = ConnectionPool.from_url(url)
+
+    # create a client with a connection from the pool
+    client = Redis(connection_pool=pool, single_connection_client=True)
+    await client.initialize()
+    with mock.patch.object(client, "connection") as a:
+        # we cannot, in unittests, or from asyncio, reliably trigger garbage collection
+        # so we must just invoke the handler
+        with pytest.warns(ResourceWarning):
+            client.__del__()
+            assert a._close.called
+
+    await client.aclose()
+    await pool.aclose()
+
+
+async def test_connection_garbage_collection(request):
+    """
+    Test that a Connection object will call close() on the
+    stream that it holds.
+    """
+
+    url: str = request.config.getoption("--redis-url")
+    pool = ConnectionPool.from_url(url)
+
+    # create a client with a connection from the pool
+    client = Redis(connection_pool=pool, single_connection_client=True)
+    await client.initialize()
+    conn = client.connection
+
+    with mock.patch.object(conn, "_reader"):
+        with mock.patch.object(conn, "_writer") as a:
+            # we cannot, in unittests, or from asyncio, reliably trigger
+            # garbage collection so we must just invoke the handler
+            with pytest.warns(ResourceWarning):
+                conn.__del__()
+                assert a.close.called
+
+    await client.aclose()
+    await pool.aclose()

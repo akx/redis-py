@@ -62,6 +62,7 @@ async def test_tcp_ssl_connect(tcp_address):
         socket_timeout=10,
     )
     await _assert_connect(conn, tcp_address, certfile=certfile, keyfile=keyfile)
+    await conn.disconnect()
 
 
 async def _assert_connect(conn, server_address, certfile=None, keyfile=None):
@@ -72,6 +73,8 @@ async def _assert_connect(conn, server_address, certfile=None, keyfile=None):
         try:
             return await _redis_request_handler(reader, writer, stop_event)
         finally:
+            writer.close()
+            await writer.wait_closed()
             finished.set()
 
     if isinstance(server_address, str):
