@@ -49,6 +49,9 @@ ocsp = [
     "pyopenssl==20.0.1",
     "requests>=2.31.0",
 ]
+jwt = [
+    "PyJWT~=2.9.0",
+]
 
 [project.urls]
 Changes = "https://github.com/redis/redis-py/releases"
